@@ -49,6 +49,10 @@ public partial class DependencyInjectionGenerator
             excludeAssignableToType = excludeAssignableToType.Construct(typeArguments);
         }
 
+        var customHandlerMethod = attribute.CustomHandler != null && attribute.CustomHandlerType == CustomHandlerType.Method
+            ? containingType.GetMembers().OfType<IMethodSymbol>().FirstOrDefault(m => m.Name == attribute.CustomHandler)
+            : null;
+
         foreach (var type in assemblies.SelectMany(GetTypesFromAssembly))
         {
             if (type.IsAbstract || !type.CanBeReferencedByName || type.TypeKind != TypeKind.Class)
@@ -86,6 +90,12 @@ public partial class DependencyInjectionGenerator
             INamedTypeSymbol[] matchedTypes = null;
             if (assignableToType != null && !IsAssignableTo(type, assignableToType, out matchedTypes))
                 continue;
+
+            // Filter by custom handler method generic constraints
+            if (customHandlerMethod != null && !SatisfiesGenericConstraints(type, customHandlerMethod))
+            {
+                continue;
+            }
 
             if (!semanticModel.IsAccessible(position, type))
                 continue;
@@ -173,19 +183,6 @@ public partial class DependencyInjectionGenerator
         return [containingType.ContainingAssembly];
     }
 
-    private static IEnumerable<IAssemblySymbol> GetSolutionAssemblies(Compilation compilation)
-    {
-        yield return compilation.Assembly;
-
-        foreach (var reference in compilation.References)
-        {
-            if (reference is CompilationReference)
-            {
-                yield return (IAssemblySymbol)compilation.GetAssemblyOrModuleSymbol(reference);
-            }
-        }
-    }
-
     private static IEnumerable<INamedTypeSymbol> GetTypesFromAssembly(IAssemblySymbol assemblySymbol)
     {
         var @namespace = assemblySymbol.GlobalNamespace;
@@ -217,5 +214,112 @@ public partial class DependencyInjectionGenerator
         return wildcard is null
             ? null
             : new Regex($"^({Regex.Escape(wildcard).Replace(@"\*", ".*").Replace(",", "|")})$");
+    }
+
+    private static bool SatisfiesGenericConstraints(INamedTypeSymbol type, IMethodSymbol customHandlerMethod)
+    {
+        if (customHandlerMethod.TypeParameters.Length == 0)
+            return true;
+
+        // Check constraints on the first type parameter (which will be the implementation type)
+        // (Other type parameters could be checked recursively from the first type parameter)
+        var typeParameter = customHandlerMethod.TypeParameters[0];
+
+        var visitedTypeParameters = new HashSet<ITypeParameterSymbol>(SymbolEqualityComparer.Default);
+        return SatisfiesGenericConstraints(type, typeParameter, customHandlerMethod, visitedTypeParameters);
+    }
+
+    private static bool SatisfiesGenericConstraints(INamedTypeSymbol type, ITypeParameterSymbol typeParameter, IMethodSymbol customHandlerMethod, HashSet<ITypeParameterSymbol> visitedTypeParameters)
+    {
+        // Prevent infinite recursion in circular constraint scenarios (e.g., X : ISmth<Y>, Y : ISmth<X>)
+        if (!visitedTypeParameters.Add(typeParameter))
+            return true;
+
+        // Check reference type constraint
+        if (typeParameter.HasReferenceTypeConstraint && type.IsValueType)
+            return false;
+
+        // Check value type constraint
+        if (typeParameter.HasValueTypeConstraint && !type.IsValueType)
+            return false;
+
+        // Check unmanaged type constraint
+        if (typeParameter.HasUnmanagedTypeConstraint && !type.IsUnmanagedType)
+            return false;
+
+        // Check constructor constraint
+        if (typeParameter.HasConstructorConstraint)
+        {
+            var hasPublicParameterlessConstructor = type.Constructors.Any(c =>
+                c.DeclaredAccessibility == Accessibility.Public &&
+                c.Parameters.Length == 0 &&
+                !c.IsStatic);
+
+            if (!hasPublicParameterlessConstructor)
+                return false;
+        }
+
+        // Check type constraints
+        foreach (var constraintType in typeParameter.ConstraintTypes)
+        {
+            if (constraintType is INamedTypeSymbol namedConstraintType)
+            {
+                if (!SatisfiesConstraintType(type, namedConstraintType, customHandlerMethod, visitedTypeParameters))
+                    return false;
+            }
+        }
+
+        return true;
+    }
+
+    private static bool SatisfiesConstraintType(INamedTypeSymbol candidateType, INamedTypeSymbol constraintType, IMethodSymbol customHandlerMethod, HashSet<ITypeParameterSymbol> visitedTypeParameters)
+    {
+        var constraintHasTypeParameters = constraintType.TypeArguments.OfType<ITypeParameterSymbol>().Any();
+
+        if (!constraintHasTypeParameters)
+        {
+            return IsAssignableTo(candidateType, constraintType, out _);
+        }
+        else
+        {
+            // We handle the case when method has multiple type arguments, e.g.
+            // private static void CustomHandler<THandler, TCommand>(this IServiceCollection services)
+            //      where THandler : class, ICommandHandler<TCommand>
+            //      where TCommand : ISpecificCommand
+
+
+            // First we check that type definitions match. E.g. if MyHandlerImplementation has interface (one or many) ICommandHandler<>.
+            if (!IsAssignableTo(candidateType, constraintType.OriginalDefinition, out var matchedTypes))
+                return false;
+
+            // Then we need to check if any matched interfaces (let's say MyHandlerImplementation implements ICommandHandler<string> and ICommandHandler<MySpecificCommand>)
+            // have matching type parameters (e.g. string does not implement ISpecificCommand, but MySpecificCommand - does).
+            return matchedTypes.Any(matchedType => MatchedTypeSatisfiesConstraints(constraintType, customHandlerMethod, matchedType, visitedTypeParameters));
+        }
+
+        static bool MatchedTypeSatisfiesConstraints(INamedTypeSymbol constraintType, IMethodSymbol customHandlerMethod, INamedTypeSymbol matchedType, HashSet<ITypeParameterSymbol> visitedTypeParameters)
+        {
+            if (constraintType.TypeArguments.Length != matchedType.TypeArguments.Length)
+                return false;
+
+            for (var i = 0; i < constraintType.TypeArguments.Length; i++)
+            {
+                if (matchedType.TypeArguments[i] is not INamedTypeSymbol candidateTypeArgument)
+                    return false;
+
+                if (constraintType.TypeArguments[i] is ITypeParameterSymbol typeParameter)
+                {
+                    if (!SatisfiesGenericConstraints(candidateTypeArgument, typeParameter, customHandlerMethod, visitedTypeParameters))
+                        return false;
+                }
+                else
+                {
+                    if (!SymbolEqualityComparer.Default.Equals(candidateTypeArgument, constraintType.TypeArguments[i]))
+                        return false;
+                }
+            }
+
+            return true;
+        }
     }
 }
